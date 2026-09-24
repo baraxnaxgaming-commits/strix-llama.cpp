@@ -215,7 +215,12 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
                     LLM_FFN_SILU, true,
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
-                    il);
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps,
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
+                    model.layers[il].ffn_down_exps_s);
             cb(cur, "ffn_moe_out", il);
         }
 

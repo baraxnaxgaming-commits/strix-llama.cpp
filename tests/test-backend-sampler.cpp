@@ -2066,6 +2066,126 @@ struct backend_test_case {
     bool enabled_by_default;
 };
 
+
+// sampler reuse: parity with fresh init, gate coverage, and the failed-init sequence
+static void test_sampler_reuse(const test_params & params) {
+    auto * model = params.model.get();
+    GGML_ASSERT(model);
+
+    auto base_params = []() {
+        common_params_sampling sp;
+        sp.seed = 42;
+        sp.temp = 0.7f;
+        sp.top_k = 20;
+        sp.top_p = 0.95f;
+        sp.min_p = 0.05f;
+        sp.penalty_repeat = 1.05f;
+        sp.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE,
+            COMMON_SAMPLER_TYPE_TOP_P, COMMON_SAMPLER_TYPE_MIN_P,
+        };
+        return sp;
+    };
+
+    // reuse vs fresh init: same fixed seed -> same sampled tokens, on CPU and with backend_sampling on
+    for (bool backend : { false, true }) {
+        auto sp = base_params();
+        sp.backend_sampling = backend;
+
+        auto sp_reuse = sp;
+        common_sampler_ptr reused(common_sampler_init(model, sp));
+        GGML_ASSERT(common_sampler_reuse(reused.get(), model, sp_reuse) && "reuse of identical params must succeed");
+
+        auto sp_fresh = sp;
+        common_sampler_ptr fresh(common_sampler_init(model, sp_fresh));
+
+        std::mt19937 rng(1234);
+        for (int step = 0; step < 16; ++step) {
+            llama_token_data tokens_a[8], tokens_b[8];
+            for (int i = 0; i < 8; ++i) {
+                tokens_a[i] = { i, (float)(rng() % 1000) / 100.0f - 5.0f, 0.0f };
+                tokens_b[i] = tokens_a[i];
+            }
+            llama_token_data_array cand_a{ tokens_a, 8, -1, false };
+            llama_sampler_apply(common_sampler_get(reused.get()), &cand_a);
+            llama_token_data_array cand_b{ tokens_b, 8, -1, false };
+            llama_sampler_apply(common_sampler_get(fresh.get()), &cand_b);
+            GGML_ASSERT(cand_a.selected == cand_b.selected && "reused sampler diverged from fresh init");
+
+            common_sampler_accept(reused.get(), tokens_a[cand_a.selected].id, true);
+            common_sampler_accept(fresh.get(),  tokens_b[cand_b.selected].id, true);
+        }
+        printf("reuse parity ok (backend_sampling = %d)\n", backend);
+    }
+
+    // seedless: the gate compares the raw seed, so reuse is allowed; per-instance rngs differ by design
+    {
+        auto sp = base_params();
+        sp.seed = LLAMA_DEFAULT_SEED;
+        auto sp2 = sp;
+        common_sampler_ptr sampler(common_sampler_init(model, sp));
+        GGML_ASSERT(common_sampler_reuse(sampler.get(), model, sp2));
+    }
+
+    // gate table: changing one field at a time must refuse reuse
+    {
+        using mutate_fn = std::function<void(common_params_sampling &)>;
+        const std::vector<std::pair<const char *, mutate_fn>> mutations = {
+            { "n_probs",            [](auto & p) { p.n_probs = 5; } },
+            { "seed",               [](auto & p) { p.seed = 43; } },
+            { "n_prev",             [](auto & p) { p.n_prev = 128; } },
+            { "temp",               [](auto & p) { p.temp = 0.8f; } },
+            { "top_k",              [](auto & p) { p.top_k = 40; } },
+            { "top_p",              [](auto & p) { p.top_p = 0.5f; } },
+            { "min_p",              [](auto & p) { p.min_p = 0.1f; } },
+            { "xtc_probability",    [](auto & p) { p.xtc_probability = 0.1f; } },
+            { "typ_p",              [](auto & p) { p.typ_p = 0.5f; } },
+            { "penalty_repeat",     [](auto & p) { p.penalty_repeat = 1.2f; } },
+            { "dry_multiplier",     [](auto & p) { p.dry_multiplier = 0.4f; } },
+            { "mirostat",           [](auto & p) { p.mirostat = 2; } },
+            { "samplers",           [](auto & p) { p.samplers.push_back(COMMON_SAMPLER_TYPE_XTC); } },
+            { "logit_bias",         [](auto & p) { p.logit_bias.push_back({ 1, 2.0f }); } },
+            { "generation_prompt",  [](auto & p) { p.generation_prompt = { 1, 2, 3 }; } },
+            { "grammar",            [](auto & p) { p.grammar = { COMMON_GRAMMAR_TYPE_USER, "root ::= [a-z]+" }; } },
+            { "reasoning_budget",   [](auto & p) {
+                p.reasoning_budget_enabled = true; p.reasoning_budget_tokens = 10;
+                p.reasoning_budget_start = { 1 }; p.reasoning_budget_end = { { 2 } }; } },
+            { "backend_sampling",   [](auto & p) { p.backend_sampling = !p.backend_sampling; } },
+        };
+
+        for (const auto & [name, mutate] : mutations) {
+            auto sp = base_params();
+            sp.backend_sampling = true;
+            common_sampler_ptr sampler(common_sampler_init(model, sp));
+            auto sp2 = sp;
+            mutate(sp2);
+            GGML_ASSERT(!common_sampler_reuse(sampler.get(), model, sp2) && "reuse must be refused");
+            printf("gate refuses on %s\n", name);
+        }
+    }
+
+    // failed-init sequence: a throwing reuse leaves the sampler intact and reusable
+    {
+        auto sp = base_params();
+        sp.backend_sampling = true;
+        common_sampler_ptr sampler(common_sampler_init(model, sp));
+
+        auto sp_bad = sp;
+        sp_bad.grammar = { COMMON_GRAMMAR_TYPE_USER, "root ::= (" };
+        bool threw = false;
+        try {
+            common_sampler_reuse(sampler.get(), model, sp_bad);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        GGML_ASSERT(threw && "invalid grammar must throw");
+
+        auto sp_ok = base_params();
+        sp_ok.backend_sampling = true;
+        GGML_ASSERT(common_sampler_reuse(sampler.get(), model, sp_ok) && "chain must survive the failed reuse");
+    }
+}
+
 // note: test names are "test_<suffix>" and match the function implementing them
 static const backend_test_case BACKEND_TESTS[] = {
     // single sampler
@@ -2086,6 +2206,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_mixed",                  test_mixed,                  true },
     { "test_cpu_mixed",              test_cpu_mixed,              true },
     { "test_set_sampler",            test_set_sampler,            true },
+    { "test_sampler_reuse",          test_sampler_reuse,          true },
     // multiple outputs per sequence
     { "test_multi_output_limit",                  test_multi_output_limit,               true },
     { "test_multi_output_multi_sequence_dist",    test_multi_output_multi_sequence_dist, true },
